@@ -66,3 +66,11 @@ The browser receives live updates through Server-Sent Events at `/events`. On-ch
 ## Repository hygiene
 
 Do not commit `node_modules`, local environment files, runtime logs, or generated build output. Never place API credentials or private keys in this repository.
+
+## License
+
+Copyright © 2026 Arraya. All rights reserved.
+
+This repository is public for portfolio and viewing purposes only. No
+permission is granted to copy, modify, distribute, sublicense, or use this
+code or project commercially without written permission.
