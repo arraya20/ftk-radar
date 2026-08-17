@@ -26,6 +26,12 @@ npm --prefix frontend install
 For a local environment, copy `.env.example` to `.env` and set `RPC_URL` only if
 the on-chain listener is needed. Keep `.env` private; it is ignored by Git.
 
+For production, set `ITEMS_PATH` to the deployed item database location and set a
+long random `ADMIN_API_TOKEN` only if private diagnostics are required. The debug
+endpoint is disabled unless `ENABLE_DEBUG_ENDPOINT=true`; keep it disabled on a
+public instance. REST and inventory rate limits, plus FTK/RPC timeouts, are
+configurable through `.env.example`.
+
 ## Run
 
 Run the API/server:
@@ -44,6 +50,10 @@ The frontend development server listens on port `4173`; the API listens on port 
 The API binds to `127.0.0.1` by default; set `HOST=0.0.0.0` only when the
 runtime requires direct network access. Set `CORS_ORIGINS` to a comma-separated
 list when the frontend is hosted on a different origin.
+
+Production should normally put Nginx or Caddy in front of Node for HTTPS,
+connection limits, and an additional request rate limit. Keep the Node process on
+localhost when using a reverse proxy.
 
 ## Production build
 

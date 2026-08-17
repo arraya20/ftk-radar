@@ -8,9 +8,10 @@
   },
   "scripts": {
     "server": "node server.js",
+    "test": "NODE_ENV=test node --test",
     "dev": "concurrently \"npm run server\" \"npm --prefix frontend run dev -- --host 0.0.0.0 --port 4173\"",
     "build": "npm --prefix frontend run build",
-    "check": "node --check server.js && node --check move-listener.js && node --check shared/ftk-api-gate.js"
+    "check": "node --check server.js && node --check move-listener.js && node --check security.js && node --check atomic-rate-gate.js && node --check shared/ftk-api-gate.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -19,5 +20,9 @@
   },
   "devDependencies": {
     "concurrently": "^8.2.2"
+  },
+  "overrides": {
+    "body-parser": "1.20.6",
+    "shell-quote": "1.10.0"
   }
 }

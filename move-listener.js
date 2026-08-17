@@ -2,13 +2,14 @@
 // Listens for app__move transactions on the FTK World contract
 // and fires a callback with decoded movement data instantly.
 
-import { JsonRpcProvider, AbiCoder, toQuantity } from 'ethers';
+import { JsonRpcProvider, AbiCoder, FetchRequest, toQuantity } from 'ethers';
 
 const WORLD_ADDRESS = '0x0888B2Dc99710879dD0917ea67A693aa3AbB3A5D';
 const APP_MOVE_SELECTOR = '0xa130aa39';
 const APP_BATTLE_PVP_SELECTOR = '0x1cfac08d';
 const APP_CHALLENGE_PVP_SELECTOR = '0x5b27c17c';
 const POLL_INTERVAL_MS = 500; // 500ms (single RPC call ~117ms)
+const RPC_TIMEOUT_MS = Number(process.env.RPC_TIMEOUT_MS || 10_000);
 const coder = AbiCoder.defaultAbiCoder();
 
 let provider = null;
@@ -25,7 +26,9 @@ let processing = false; // polling lock — prevents overlapping runs when RPC i
  * @param {function} onPvp - callback(attackerId, defenderId, blockNumber, txHash, kind)
  */
 export function startMoveListener(rpcUrl, onMove, onPvp) {
-  provider = new JsonRpcProvider(rpcUrl);
+  const request = new FetchRequest(rpcUrl);
+  request.timeout = RPC_TIMEOUT_MS;
+  provider = new JsonRpcProvider(request);
   moveCallback = onMove;
   pvpCallback = onPvp;
   lastBlock = 0;

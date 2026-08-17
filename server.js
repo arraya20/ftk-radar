@@ -4,54 +4,29 @@ import path from 'node:path';
 
 // Trust nginx reverse proxy so req.ip reflects X-Forwarded-For / X-Real-IP
 import { fileURLToPath } from 'node:url';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { startMoveListener } from './move-listener.js';
+import { createAtomicRateGate } from './atomic-rate-gate.js';
+import { createRateLimiter, fetchWithTimeout, requireAdminToken } from './security.js';
 
 // ─── Cross-process API gate (shared with ftk-bot) ───
-const GATE_FILE = '/tmp/ftk-api-gate.json';
-const GATE_MIN_GAP_MS = 1200;
-
-function readGate() {
-  try {
-    if (!existsSync(GATE_FILE)) return 0;
-    const data = JSON.parse(readFileSync(GATE_FILE, 'utf8'));
-    return typeof data.nextAllowedAt === 'number' ? data.nextAllowedAt : 0;
-  } catch { return 0; }
-}
-
-function writeGate(nextAllowedAt) {
-  try { writeFileSync(GATE_FILE, JSON.stringify({ nextAllowedAt }), 'utf8'); } catch {}
-}
-
-async function acquireGate() {
-  const nextAllowed = readGate();
-  const waitMs = nextAllowed - Date.now();
-  if (waitMs > 0) await sleep(waitMs);
-  writeGate(Date.now() + GATE_MIN_GAP_MS);
-}
-
-function signalCooldown(cooldownMs = 60_000) {
-  writeGate(Date.now() + cooldownMs);
-}
-
-function gateStatus() {
-  const nextAllowed = readGate();
-  return {
-    nextAllowedAt: nextAllowed,
-    cooldownSeconds: Math.max(0, Math.ceil((nextAllowed - Date.now()) / 1000)),
-  };
-}
+const gate = createAtomicRateGate({
+  stateFile: process.env.FTK_API_GATE_FILE || '/tmp/ftk-api-gate.json',
+  minGapMs: Number(process.env.FTK_API_MIN_GAP_MS || 1_200),
+});
+const acquireGate = label => gate.acquire(label);
+const signalCooldown = cooldownMs => gate.cooldown(cooldownMs);
 
 // ─── Item database for name resolution ───
-const FTK_BOT_DIR = '/home/ubuntu/ftk-bot';
+const ITEMS_PATH = process.env.ITEMS_PATH || '/home/ubuntu/ftk-bot/data/items.json';
 let ITEM_DB = {};
 try {
-  const raw = readFileSync(path.join(FTK_BOT_DIR, 'data', 'items.json'), 'utf8');
+  const raw = readFileSync(ITEMS_PATH, 'utf8');
   const parsed = JSON.parse(raw);
   ITEM_DB = parsed.items ?? parsed;
-  console.log(`[items] Loaded ${Object.keys(ITEM_DB).length} items from items.json`);
+  console.log(`[items] Loaded ${Object.keys(ITEM_DB).length} items from ${ITEMS_PATH}`);
 } catch (err) {
-  console.warn('[items] Failed to load items.json:', err.message);
+  console.warn(`[items] Failed to load ${ITEMS_PATH}:`, err.message);
 }
 
 function resolveItemName(itemId) {
@@ -95,7 +70,7 @@ const INVENTORY_CACHE_TTL = 60_000;
 const INVENTORY_CACHE_MAX = 500; // LRU cap — evict oldest to bound memory
 
 // Insert into inventoryCache with LRU eviction (Map preserves insertion order).
-function setInventoryCache(id, data) {
+export function setInventoryCache(id, data) {
   inventoryCache.delete(id); // re-insert to move to newest position
   inventoryCache.set(id, { data, fetchedAt: Date.now() });
   while (inventoryCache.size > INVENTORY_CACHE_MAX) {
@@ -104,8 +79,13 @@ function setInventoryCache(id, data) {
   }
 }
 
+export function getInventoryCacheSize() {
+  return inventoryCache.size;
+}
+
 const PORT = Number(process.env.PORT || 4000);
 const HOST = process.env.HOST || '127.0.0.1';
+const EXTERNAL_FETCH_TIMEOUT_MS = Number(process.env.EXTERNAL_FETCH_TIMEOUT_MS || 10_000);
 const CORS_ORIGINS = new Set(
   (process.env.CORS_ORIGINS || '')
     .split(',')
@@ -168,7 +148,7 @@ async function pollCombatEvents() {
   try {
     // Dedicated combat fetch: do not queue behind the 5-minute character metadata poll.
     // This endpoint is small and is the fallback/enrichment path only.
-    const response = await fetch(`${API_BASE}/characterPvp/${NAMRI_ID}?limit=20`);
+    const response = await fetchWithTimeout(`${API_BASE}/characterPvp/${NAMRI_ID}?limit=20`, {}, EXTERNAL_FETCH_TIMEOUT_MS);
     if (!response.ok) return;
     const rows = (await response.json())?.data ?? [];
     const before = new Set(combatEvents.map((e) => e.id));
@@ -182,9 +162,6 @@ async function pollCombatEvents() {
 
 // Combat API is the current authoritative event source; poll frequently, then fan out via SSE.
 // Keep this separate from the heavier player metadata polls.
-setInterval(pollCombatEvents, 5_000);
-setTimeout(() => pollCombatEvents(), 0);
-
 function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of sseClients) {
@@ -266,11 +243,6 @@ function buildStatus() {
     tilesScanned: tileCache.size,
     scanRing,
     scanComplete,
-    gate: gateStatus(),
-    apiCooldownSeconds: Math.max(0, Math.ceil((apiCooldownUntil - Date.now()) / 1000)),
-    rateLimitHitCount,
-    trackedGuildIds: TRACKED_GUILD_IDS,
-    trackedGuildLabels: TRACKED_GUILD_LABELS,
   };
 }
 
@@ -283,6 +255,19 @@ app.use(cors({
     callback(null, !origin || CORS_ORIGINS.has(origin));
   },
 }));
+const restRateLimiter = createRateLimiter({
+  windowMs: Number(process.env.REST_RATE_LIMIT_WINDOW_MS || 60_000),
+  max: Number(process.env.REST_RATE_LIMIT_MAX || 120),
+});
+const inventoryRateLimiter = createRateLimiter({
+  windowMs: Number(process.env.INVENTORY_RATE_LIMIT_WINDOW_MS || 60_000),
+  max: Number(process.env.INVENTORY_RATE_LIMIT_MAX || 20),
+});
+app.use('/api/', restRateLimiter);
+const adminDebugAccess = (req, res, next) => {
+  if (process.env.ENABLE_DEBUG_ENDPOINT !== 'true') return res.status(404).json({ error: 'Not found' });
+  return requireAdminToken()(req, res, next);
+};
 
 // Baseline security headers (no external dependency — manual middleware).
 app.use((req, res, next) => {
@@ -454,12 +439,12 @@ async function fetchTile(x, y) {
   try {
     await rateLimitGuard();
     const url = `${API_BASE}/tileInfo?x=${x}&y=${y}`;
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       headers: {
         accept: 'application/json',
         'user-agent': 'ftk-radar/0.2',
       },
-    });
+    }, EXTERNAL_FETCH_TIMEOUT_MS);
     if (!response.ok) {
       if (response.status === 429) noteRateLimited();
       return null;
@@ -520,12 +505,12 @@ async function spiralScanCycle() {
 
 async function fetchJson(url) {
   await rateLimitGuard();
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: {
       accept: 'application/json',
       'user-agent': 'ftk-radar-mvp/0.1',
     },
-  });
+  }, EXTERNAL_FETCH_TIMEOUT_MS);
 
   if (!response.ok) {
     const body = await response.text().catch(() => '');
@@ -957,11 +942,11 @@ app.get('/api/players', (_req, res) => {
 });
 
 app.get('/api/me', (_req, res) => {
-  if (!cache.me) return res.status(503).json({ error: 'Namri data not loaded yet', lastError: cache.lastError });
+  if (!cache.me) return res.status(503).json({ error: 'Namri data not loaded yet' });
   res.json(cache.me);
 });
 
-app.get('/api/debug/player/:query', (req, res) => {
+app.get('/api/debug/player/:query', adminDebugAccess, (req, res) => {
   const query = String(req.params.query ?? '').toLowerCase();
   const idQuery = Number(query);
   const players = [...cache.players, cache.me].filter(Boolean);
@@ -984,27 +969,11 @@ app.get('/api/status', (_req, res) => {
     playerCount: cache.players.length,
     onlineCount: cache.onlineCount,
     trackedCount: cache.trackedCount,
-    onlineWindowSeconds: ONLINE_WINDOW_SECONDS,
     lastUpdated: cache.lastUpdated,
-    lastError: cache.lastError,
     polling: cache.polling,
-    positionPolling,
-    refreshIntervals: {
-      fullSeconds: FULL_REFRESH_INTERVAL_MS / 1000,
-      positionSeconds: POSITION_REFRESH_INTERVAL_MS / 1000,
-      leaderboardSeconds: LEADERBOARD_REFRESH_INTERVAL_MS / 1000,
-      leaderboardPages: MAX_LEADERBOARD_PAGES,
-      guildSeconds: GUILD_REFRESH_INTERVAL_MS / 1000,
-      tileSeconds: TILE_SCAN_INTERVAL_MS / 1000,
-    },
     tilesScanned: tileCache.size,
     scanRing,
     scanComplete,
-    apiCooldownSeconds: Math.max(0, Math.ceil((apiCooldownUntil - Date.now()) / 1000)),
-    rateLimitHitCount,
-    gate: gateStatus(),
-    trackedGuildIds: TRACKED_GUILD_IDS,
-    trackedGuildLabels: TRACKED_GUILD_LABELS,
   });
 });
 
@@ -1030,7 +999,7 @@ app.get('/api/tiles', (req, res) => {
 
 // ─── On-demand player inventory endpoint ───
 
-app.get('/api/player/:id', async (req, res) => {
+app.get('/api/player/:id', inventoryRateLimiter, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
 
@@ -1183,6 +1152,10 @@ app.get('/events', (req, res) => {
   });
 });
 
+export function getSseClientCount() {
+  return sseClients.size;
+}
+
 // ─── Serve frontend ───
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1206,8 +1179,12 @@ app.get('*', (req, res, next) => {
   });
 });
 
-app.listen(PORT, HOST, () => {
+export function startServer() {
+  return app.listen(PORT, HOST, () => {
   console.log(`FTK Radar backend listening on http://${HOST}:${PORT}`);
+
+  setInterval(pollCombatEvents, 5_000);
+  setTimeout(() => pollCombatEvents(), 0);
 
   // Initial full player poll, then lighter position refreshes between full polls.
   pollFtk();
@@ -1273,4 +1250,9 @@ app.listen(PORT, HOST, () => {
   } else {
     console.warn('[move-listener] RPC_URL not set — on-chain listener disabled');
   }
-});
+  });
+}
+
+export { app, restRateLimiter, inventoryRateLimiter };
+
+if (process.env.NODE_ENV !== 'test') startServer();
